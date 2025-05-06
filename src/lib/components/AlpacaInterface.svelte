@@ -1,5 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  // Remove shadcn-svelte component imports
+  // import * as Card from "$lib/components/ui/card";
+  // import * as Accordion from "$lib/components/ui/accordion";
+  // import { Button } from "$lib/components/ui/button";
+  // import { Input } from "$lib/components/ui/input";
+  // import { Label } from "$lib/components/ui/label";
+  // import { Textarea } from "$lib/components/ui/textarea";
+  // import { cn } from "$lib/utils"; // Utility for conditional classes
 
   // --- State Variables ---
   let ws: WebSocket | null = null;
@@ -13,6 +21,7 @@
   let isProcessing: boolean = false; // General flag for ongoing interaction (text or voice)
 
   // UI Content State
+  let userName: string = "User"; // Add state for username, default matches server
   let textInput: string = "";
   let currentTranscript: string = "";
   let assistantResponseText: string = ""; // For displaying text/LLM responses
@@ -147,7 +156,7 @@
     console.log(`Connecting to ${wsUrl}...`);
     connectionStatus = "Connecting";
     messages = [];
-    assistantResponseText = "";
+    assistantResponseText = ""; // Clear response on new connection
     currentTranscript = "";
     textInput = "";
     audioQueue = [];
@@ -164,6 +173,7 @@
         console.log("WebSocket connected");
         connectionStatus = "Connected";
         voiceState = "Idle"; // Ensure idle state on connect
+        // No need to send anything, server sends greeting
       };
 
       ws.onmessage = (event) => {
@@ -179,7 +189,6 @@
           switch (messageData.type) {
             case "status":
               voiceState = messageData.state || "Unknown";
-              status = `Status: ${voiceState}`; // Keep the old status for basic display compat for now
               console.log("Status Updated:", voiceState);
               if (interactionMode === "voice") {
                 isProcessing = ![
@@ -196,7 +205,6 @@
                   console.log(
                     "Voice interaction ended. Switching to text mode."
                   );
-                  // Optionally clear assistant text response too, or keep it? Keep it for now.
                 }
               } else if (interactionMode === "text") {
                 isProcessing = !["Idle", "Error"].includes(voiceState);
@@ -211,10 +219,12 @@
               console.log("Transcript Updated:", currentTranscript);
               break;
 
-            case "llm_chunk": // Assuming this type for text responses
+            case "llm_chunk": // Handles initial greeting AND text responses
               assistantResponseText += messageData.text || "";
               console.log("LLM Chunk Received");
-              isProcessing = true; // Mark as processing while receiving chunks
+              // Don't set isProcessing=true here unconditionally,
+              // as initial greeting chunks arrive before interaction starts.
+              // isProcessing is set when *initiating* text/voice actions.
               break;
 
             case "audio_chunk":
@@ -227,11 +237,16 @@
 
             case "error":
               voiceState = "Error";
-              status = `Error: ${messageData.message}`; // Keep old status variable updated
+              assistantResponseText = `Error: ${messageData.message}`; // Show error in response area
               console.error("Server Error:", messageData.message);
               isProcessing = false;
-              // Decide if we switch back to text mode on error
               interactionMode = "text";
+              break;
+
+            // Add case for 'info' messages from server if needed
+            case "info":
+              console.log("Server Info:", messageData.message);
+              // Optionally display info messages somewhere?
               break;
 
             default:
@@ -244,8 +259,7 @@
             error
           );
           messages = [...messages, `[RAW/ERROR] ${event.data}`];
-          assistantResponseText += `
-[Error processing message: ${event.data}]`;
+          assistantResponseText += `\n[Error processing message: ${event.data}]`;
           isProcessing = false; // Stop processing on parse error
           interactionMode = "text"; // Revert to text mode on error
         }
@@ -296,11 +310,18 @@
       interactionMode === "text" &&
       !isProcessing
     ) {
-      console.log("Sending text message:", textInput);
-      assistantResponseText = ""; // Clear previous response
+      console.log("Sending text message:", textInput, "as", userName);
+      assistantResponseText = ""; // Clear previous response before sending
       isProcessing = true;
       voiceState = "Processing"; // Use voiceState temporarily for unified status
-      ws.send(JSON.stringify({ action: "send_text", text: textInput.trim() }));
+      // Include user_name in the payload
+      ws.send(
+        JSON.stringify({
+          action: "send_text",
+          text: textInput.trim(),
+          user_name: userName,
+        })
+      );
       textInput = ""; // Clear input field after sending
     } else {
       console.warn("Cannot send text message. Conditions not met:", {
@@ -319,15 +340,18 @@
       interactionMode === "text" &&
       !isProcessing
     ) {
-      console.log("Sending start voice interaction command...");
+      console.log("Sending start voice interaction command as", userName);
       interactionMode = "voice";
       isProcessing = true; // Set processing true immediately
       voiceState = "Initializing"; // Or Starting?
-      assistantResponseText = ""; // Clear previous text response
+      assistantResponseText = ""; // Clear previous text response before starting
       currentTranscript = ""; // Clear previous transcript
       audioQueue = []; // Clear any residual audio
       isPlayingAudio = false;
-      ws.send(JSON.stringify({ action: "start", mode: "voice" }));
+      // Include user_name in the payload
+      ws.send(
+        JSON.stringify({ action: "start", mode: "voice", user_name: userName })
+      );
     } else {
       console.warn("Cannot start voice interaction. Conditions not met:", {
         connected: ws?.readyState === WebSocket.OPEN,
@@ -341,10 +365,8 @@
     // This can stop both voice and potentially long text generations
     if (ws && ws.readyState === WebSocket.OPEN && isProcessing) {
       console.log("Sending stop interaction command...");
+      // Include username when stopping too? Might not be necessary on backend.
       ws.send(JSON.stringify({ action: "stop" }));
-      // State changes (like setting isProcessing=false, interactionMode='text')
-      // will be triggered by the final status message from the server via onmessage.
-      // We might want to optimistically set isProcessing = false here, but let's wait for confirmation.
       voiceState = "Stopping..."; // Optimistic update
     } else {
       console.warn("WebSocket not connected or no interaction active to stop.");
@@ -388,6 +410,18 @@
     <span>Status: <strong>{connectionStatus}</strong></span>
   </div>
 
+  <!-- Add Username Input Section - MOVED HERE -->
+  <div class="controls username-controls">
+    <label for="userNameInput">Your Name:</label>
+    <input
+      id="userNameInput"
+      type="text"
+      bind:value={userName}
+      placeholder="Enter your name"
+      disabled={isProcessing || connectionStatus === "Connecting"}
+    />
+  </div>
+
   {#if connectionStatus === "Connected"}
     <!-- Interaction Controls -->
     <div class="controls interaction-controls">
@@ -413,7 +447,8 @@
           placeholder="Enter your message here..."
           rows="3"
           disabled={isProcessing || connectionStatus !== "Connected"}
-          on:keydown={(e) => {
+          on:keydown={(e: KeyboardEvent) => {
+            // Add type annotation for event
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               sendTextMessage();
@@ -479,6 +514,16 @@
     flex-grow: 1;
     margin-left: 0.5rem;
   }
+
+  /* Add style for username controls */
+  .username-controls label {
+    margin-right: 0.5rem; /* Add some space after label */
+  }
+
+  .username-controls input {
+    flex-grow: 1; /* Allow input to take available space */
+  }
+  /* --- */
 
   label {
     display: flex;

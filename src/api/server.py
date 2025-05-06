@@ -31,6 +31,8 @@ from dotenv import load_dotenv
 alpaca_instance: Union[Alpaca, None] = None
 # This will hold the configuration loaded at startup
 loaded_config_data: Union[Dict[str, Any], None] = None
+# Store the username received from the client (simple global for single connection)
+current_user_name: str = "User" # Default username
 # ----------------
 
 app = FastAPI(
@@ -162,8 +164,8 @@ async def handle_interaction_queue(websocket: WebSocket, queue: Queue):
             message = await queue.get()
             await websocket.send_json(message)
             queue.task_done()
-            # If the message indicates the end of interaction (e.g., Idle, Error, Interrupted, Cancelled), stop reading
-            if message.get("type") == "status" and message.get("state") in ["Idle", "Error", "Interrupted", "Cancelled", "Disabled"]:
+            # If the message indicates the end of interaction (e.g., Idle, Error, Interrupted, Cancelled, Disabled), stop reading
+            if message.get("type") == "status" and message.get("state") in ["Error", "Cancelled", "Disabled"]:
                  print(f"[QueueReader] Received final state '{message.get('state')}'. Exiting.")
                  break
     except asyncio.CancelledError:
@@ -186,7 +188,7 @@ async def handle_interaction_queue(websocket: WebSocket, queue: Queue):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Handles the main WebSocket connection for real-time interaction."""
-    global alpaca_instance, current_interaction_task, queue_reader_task, interaction_queue
+    global alpaca_instance, current_interaction_task, queue_reader_task, interaction_queue, current_user_name
 
     client_address = f"{websocket.client.host}:{websocket.client.port}"
     print(f"WebSocket connection established from {client_address}")
@@ -206,12 +208,77 @@ async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
+    # --- Generate and Send Initial Greeting ---
+    if alpaca_instance and hasattr(alpaca_instance, 'interaction_handler'):
+        try:
+            print(f"[{client_address}] Generating initial greeting...")
+            # Pass the *default* username for the initial greeting
+            initial_greeting = await alpaca_instance.interaction_handler.generate_initial_greeting(user_name=current_user_name)
+            
+            # Try sending the greeting, catching disconnect specifically
+            try:
+                await websocket.send_json({"type": "llm_chunk", "text": initial_greeting})
+                print(f"[{client_address}] Initial greeting sent.")
+            except WebSocketDisconnect:
+                print(f"[{client_address}] Client disconnected before initial greeting could be sent.")
+                return # Exit endpoint cleanly for this connection
+            except Exception as send_e:
+                print(f"[{client_address}] Error sending initial greeting message (but not disconnect): {send_e}")
+                # Optionally send error or close, but handle potential disconnect here too
+                try:
+                     await websocket.send_json({"type": "error", "message": f"Failed to send initial greeting: {send_e}", "state": "Error"})
+                except WebSocketDisconnect:
+                     print(f"[{client_address}] Client disconnected before greeting send error could be sent.")
+                return # Exit endpoint
+
+        except WebSocketDisconnect:
+             # This might catch disconnects during the greeting *generation* if it involves yielding
+             print(f"[{client_address}] Client disconnected during initial greeting generation.")
+             return # Exit endpoint cleanly
+        except Exception as e: # Catch errors during greeting *generation*
+            print(f"[{client_address}] Error generating initial greeting: {e}")
+            traceback.print_exc()
+            # Send error to client if greeting generation fails, handling potential disconnect
+            try:
+                 await websocket.send_json({"type": "error", "message": f"Failed to generate initial greeting: {e}", "state": "Error"})
+            except WebSocketDisconnect:
+                 print(f"[{client_address}] Client disconnected before greeting generation error could be sent.")
+            except Exception as send_e:
+                 print(f"[{client_address}] Error sending greeting generation error message: {send_e}")
+            return # Exit endpoint after generation error
+            
+    elif not alpaca_instance:
+        print(f"[{client_address}] Cannot send greeting: Alpaca instance not available.")
+        try:
+            await websocket.send_json({"type": "error", "message": "Alpaca assistant not initialized on server.", "state": "Error"})
+            await websocket.close(code=1011)
+        except WebSocketDisconnect:
+             print(f"[{client_address}] Client disconnected before Alpaca init error could be sent.")
+        return
+    else: # alpaca_instance exists but no interaction_handler?
+        print(f"[{client_address}] Cannot send greeting: Alpaca interaction handler not found.")
+        try:
+            await websocket.send_json({"type": "error", "message": "Alpaca assistant improperly configured on server.", "state": "Error"})
+            await websocket.close(code=1011)
+        except WebSocketDisconnect:
+             print(f"[{client_address}] Client disconnected before Alpaca config error could be sent.")
+        return
+    # ----------------------------------------
+
     try:
+        # --- Main Message Loop ---
         while True:
-            data = await websocket.receive_json()
-            print(f"Received WS message: {data}")
+            data = await websocket.receive_json() # Wait for messages *after* greeting
+            print(f"[{client_address}] Received WS message: {data}")
 
             action = data.get("action")
+
+            # Check for username in the message and update global state
+            # This allows the client to set/update the name with any action
+            client_user_name = data.get("user_name")
+            if client_user_name and isinstance(client_user_name, str):
+                current_user_name = client_user_name.strip()
+                print(f"[{client_address}] Updated username to: '{current_user_name}'")
 
             if not alpaca_instance:
                 await websocket.send_json({"type": "error", "message": "Alpaca assistant not initialized.", "state": "Error"})
@@ -243,15 +310,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         duration = alpaca_instance.duration_arg if hasattr(alpaca_instance, 'duration_arg') else None
                         
                         print(f"Starting voice interaction task (timeout={timeout}, phrase_limit={phrase_limit}, duration={duration})...")
-                        # Start the actual interaction task, passing the queue
+                        # Start the actual interaction task, passing the queue and current username
                         current_interaction_task = asyncio.create_task(
-                            alpaca_instance.interaction_handler.run_single_interaction(
+                            alpaca_instance.interaction_handler.run_voice_interaction_loop(
                                 status_queue=interaction_queue,
                                 duration=duration,
                                 timeout=timeout,
-                                phrase_limit=phrase_limit
+                                phrase_limit=phrase_limit,
+                                user_name=current_user_name # Pass current name
                             ),
-                            name=f"VoiceInteraction_{client_address}"
+                            name=f"VoiceInteractionLoop_{client_address}"
                         )
 
                         # Optional: Monitor the interaction task completion/failure
@@ -329,7 +397,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "Received empty text for 'send_text' action.", "state": "Idle"})
                     continue
 
-                print(f"Received 'send_text': '{text[:50]}...'")
+                print(f"Received 'send_text': '{text[:50]}...'" + (f" (User: {current_user_name})" if current_user_name else ""))
                 
                 if current_interaction_task and not current_interaction_task.done():
                     await websocket.send_json({"type": "error", "message": "Cannot send text while voice interaction is active.", "state": "Busy"})
@@ -339,7 +407,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     if not hasattr(alpaca_instance, 'interaction_handler'):
                         raise AttributeError("Alpaca instance lacks an 'interaction_handler'")
-                    response_generator = await alpaca_instance.interaction_handler.run_single_text_interaction(text)
+                    # Pass current username to the text interaction handler
+                    response_generator = await alpaca_instance.interaction_handler.run_single_text_interaction(
+                        user_text=text, 
+                        user_name=current_user_name
+                    )
                     full_response = ""
                     for chunk in response_generator:
                         if chunk:
